@@ -203,27 +203,110 @@ def generate_season_summary(model, filename: str = "season_summary.csv"):
     print(f"  Generated season summary for Season {model.current_season}")
 
 
+def generate_agent_stats_by_season(model, output_dir):
+    """
+    Generate detailed agent statistics by season.
+    Matches original Java output format.
+    """
+    import pandas as pd
+    import os
+
+    agent_stats = []
+
+    for agent in model.hominid_agents:
+        for season in range(model.params.number_of_seasons):
+            stats = {
+                'agent_id': agent.unique_id,
+                'species': agent.species.value,
+                'season': season + 1,
+                'plant_calories': agent.plant_calories_by_season[season],
+                'carcass_calories': agent.carcass_calories_by_season[season],
+                'root_calories': agent.root_calories_by_season[season],
+                'nonroot_calories': agent.nonroot_calories_by_season[season],
+                'total_calories': (
+                    agent.plant_calories_by_season[season] +
+                    agent.carcass_calories_by_season[season]
+                ),
+                'group_nesting': agent.group_nesting,
+                'can_dig': agent.can_dig,
+                'can_eat_meat': agent.can_eat_meat,
+                'cooperates': agent.cooperates
+            }
+            agent_stats.append(stats)
+
+    # Write to CSV
+    df = pd.DataFrame(agent_stats)
+    output_file = os.path.join(output_dir, 'agent_stats_by_season.csv')
+    df.to_csv(output_file, index=False)
+    print(f"  Generated {output_file}")
+
+    return df
+
+
+def generate_daily_calories(model, output_dir):
+    """
+    Generate daily calorie consumption by agent.
+    """
+    import pandas as pd
+    import os
+
+    daily_data = []
+
+    for agent in model.hominid_agents:
+        for day in range(model.params.days_in_year):
+            daily_data.append({
+                'agent_id': agent.unique_id,
+                'species': agent.species.value,
+                'day': day + 1,
+                'plant_calories': agent.daily_plant_calories[day],
+                'carcass_calories': agent.daily_carcass_calories[day],
+                'total_calories': (
+                    agent.daily_plant_calories[day] +
+                    agent.daily_carcass_calories[day]
+                )
+            })
+
+    df = pd.DataFrame(daily_data)
+    output_file = os.path.join(output_dir, 'daily_calories.csv')
+    df.to_csv(output_file, index=False)
+    print(f"  Generated {output_file}")
+
+    return df
+
+
 def generate_all_outputs(model, output_dir: str = "output"):
     """
     Generate all output files.
-    
+
     Args:
         model: The HOMINIDSModel instance
         output_dir: Directory to save output files
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-    
+
     print(f"\nGenerating output files in {output_dir}/")
     print("="*50)
-    
+
     # Generate all output files
     generate_spatial_csv(model, os.path.join(output_dir, "spatial_output.csv"))
     generate_agent_stats(model, os.path.join(output_dir, "agent_stats.csv"))
     generate_season_summary(model, os.path.join(output_dir, "season_summary.csv"))
-    
+
+    # Generate new detailed outputs (Phase 5)
+    season_df = generate_agent_stats_by_season(model, output_dir)
+    daily_df = generate_daily_calories(model, output_dir)
+
     print("="*50)
     print("Output generation complete!")
+
+    return {
+        'spatial': None,
+        'agent_stats': None,
+        'season_summary': None,
+        'season_stats': season_df,
+        'daily_calories': daily_df
+    }
 
 
 if __name__ == "__main__":

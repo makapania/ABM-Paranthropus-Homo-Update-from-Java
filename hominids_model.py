@@ -198,8 +198,9 @@ class HominidAgent(Agent):
             can_eat_meat: If True, can scavenge carcasses
             cooperates: If True, cooperates with others for large carcasses (requires can_eat_meat)
         """
-        super().__init__(unique_id, model)
-        
+        super().__init__(model)
+        self.unique_id = unique_id  # Set unique_id manually for Mesa 3.x
+
         self.species = species
         self.group_nesting = group_nesting
         self.can_dig = can_dig
@@ -226,10 +227,29 @@ class HominidAgent(Agent):
         self.active_time_remaining = params.active_time_units_per_day
         self.is_nesting = False
         self.nest_location = None
-        
+
         # Activity tracking for output
         self.activity_log = {}  # Will track time spent in each cell
-        
+
+        # Detailed calorie tracking (from Agent.java:148-164)
+        n_seasons = self.model.params.number_of_seasons
+        n_days = self.model.params.days_in_year
+
+        # Calorie tracking by season
+        self.plant_calories_by_season = [0.0] * n_seasons
+        self.carcass_calories_by_season = [0.0] * n_seasons
+        self.root_calories_by_season = [0.0] * n_seasons  # Dug plants (tubers)
+        self.nonroot_calories_by_season = [0.0] * n_seasons  # Non-dug plants
+
+        # Calorie tracking by day
+        self.daily_plant_calories = [0.0] * n_days
+        self.daily_carcass_calories = [0.0] * n_days
+
+        # Carcass management
+        self.ignored_carcasses = []  # Carcasses agent has abandoned
+        self.wait_timer = 0  # Minutes remaining to wait at carcass
+        self.waiting_at_carcass = None  # Carcass agent is waiting at
+
     def step(self):
         """
         Execute one time step (1 minute) of agent behavior.
@@ -255,34 +275,52 @@ class HominidAgent(Agent):
                 self.nest_location = nest_site
                 return
         
-        # Get food options in current cell
+        # Get food options in neighborhood (9-cell Moore neighborhood)
         food_options = self.scan_for_food()
-        
+
         # Check for carcasses if agent can eat meat
         carcass_options = self.scan_for_carcasses()
-        
+
+        # Check for carcass calls from other agents
+        called_carcass = self.check_for_carcass_calls()
+        if called_carcass and called_carcass not in carcass_options:
+            carcass_options.append(called_carcass)
+
         # Choose between plant food and carcass meat (optimal foraging)
-        best_plant = self.choose_best_food(food_options) if food_options else None
+        best_plant, plant_cell = self.choose_best_food(food_options) if food_options else (None, None)
         best_carcass = self.choose_best_carcass(carcass_options) if carcass_options else None
-        
+
         # Choose the option with highest return rate
         if best_plant and best_carcass:
             # Compare return rates (meat has higher calories per gram)
             plant_return = best_plant.return_rate
-            meat_return = (self.model.params.carcass_calories_per_gram * 
-                          self.model.params.carcass_grams_eaten_per_unit_time / 
-                          self.model.params.carcass_grams_eaten_per_unit_time)  # Simplified
-            
+            meat_return = (self.model.params.carcass_calories_per_gram *
+                          self.model.params.carcass_grams_eaten_per_unit_time)
+
             if meat_return > plant_return:
                 self.scavenge_carcass(best_carcass)
             else:
+                # Move to plant cell if not already there
+                if plant_cell != self.pos:
+                    self.model.grid.move_agent(self, plant_cell)
+                    # Log travel
+                    if plant_cell not in self.activity_log:
+                        self.activity_log[plant_cell] = {'eating': 0, 'traveling': 0}
+                    self.activity_log[plant_cell]['traveling'] += 1
                 self.eat_food(best_plant)
         elif best_plant:
+            # Move to plant cell if not already there
+            if plant_cell != self.pos:
+                self.model.grid.move_agent(self, plant_cell)
+                # Log travel
+                if plant_cell not in self.activity_log:
+                    self.activity_log[plant_cell] = {'eating': 0, 'traveling': 0}
+                self.activity_log[plant_cell]['traveling'] += 1
             self.eat_food(best_plant)
         elif best_carcass:
             self.scavenge_carcass(best_carcass)
         else:
-            # No food here, try to move
+            # No food in neighborhood, try to move
             self.move_toward_food()
         
         # Decrement active time
@@ -290,45 +328,57 @@ class HominidAgent(Agent):
     
     def scan_for_food(self):
         """
-        Scan current cell for available food options.
-        Returns list of (PlantSpecies, amount) tuples for visible food.
+        Scan current cell AND neighbors for available food options.
+        Returns list of (PlantSpecies, amount, cell_pos, distance) tuples.
+
+        From Agent.java:973-1102 (plantScan method)
+        Scans 9-cell Moore neighborhood including current cell.
         """
         if not hasattr(self, 'pos') or self.pos is None:
             return []
-        
-        # Get cell food from model
-        cell_contents = self.model.grid.get_cell_list_contents([self.pos])
-        
-        # Find CellFood object
-        cell_food = None
-        for obj in cell_contents:
-            if isinstance(obj, CellFood):
-                cell_food = obj
-                break
-        
-        if not cell_food:
-            return []
-        
-        # Get available foods in current season
-        available_foods = cell_food.get_available_food(
-            self.model.plant_species,
-            self.model.current_season
+
+        # Get Moore neighborhood (including current cell)
+        neighbors = self.model.grid.get_neighborhood(
+            self.pos,
+            moore=True,
+            include_center=True
         )
-        
-        # Filter by what this agent can eat and detect
+
         visible_foods = []
-        for species, amount in available_foods:
-            # Check if agent can eat this
-            if not species.can_be_eaten_by(
-                self.species.value,
-                self.can_dig
-            ):
+
+        for cell_pos in neighbors:
+            # Get cell food
+            cell_contents = self.model.grid.get_cell_list_contents([cell_pos])
+            cell_food = None
+            for obj in cell_contents:
+                if isinstance(obj, CellFood):
+                    cell_food = obj
+                    break
+
+            if not cell_food:
                 continue
-            
-            # Probabilistic detection
-            if self.model.random.random() < species.visibility_probability:
-                visible_foods.append((species, amount))
-        
+
+            # Get available foods in current season
+            available_foods = cell_food.get_available_food(
+                self.model.plant_species,
+                self.model.current_season
+            )
+
+            # Filter by what this agent can eat and detect
+            for species, amount in available_foods:
+                # Check if agent can eat this
+                if not species.can_be_eaten_by(
+                    self.species.value,
+                    self.can_dig
+                ):
+                    continue
+
+                # Probabilistic detection
+                if self.model.random.random() < species.visibility_probability:
+                    # Calculate distance for prioritization
+                    distance = self.calculate_distance(self.pos, cell_pos)
+                    visible_foods.append((species, amount, cell_pos, distance))
+
         return visible_foods
     
     def scan_for_carcasses(self):
@@ -372,63 +422,224 @@ class HominidAgent(Agent):
     
     def scavenge_carcass(self, carcass):
         """
-        Scavenge meat from a carcass.
-        Updates calories and gut contents.
+        Scavenge meat from a carcass. May need to wait for others.
         """
+        from carcass_system import CarcassSize
+
+        # Count agents at carcass location
+        n_agents_here = len([
+            a for a in self.model.hominid_agents
+            if a.pos == carcass.location and a.species == self.species
+        ])
+
+        # If first to arrive and cooperator, notify others
+        if n_agents_here == 1 and self.cooperates:
+            self.notify_others_of_carcass(carcass)
+
+        # Check if can eat (small carcass or enough cooperators)
+        required = int(self.model.params.number_of_agents_for_carcass)
+
+        if carcass.size == CarcassSize.SMALL:
+            # Small carcass - can eat alone
+            self._consume_meat(carcass)
+        elif n_agents_here >= required:
+            # Enough cooperators present
+            self._consume_meat(carcass)
+        elif self.cooperates and self.wait_timer == 0:
+            # Start waiting for help
+            self.wait_timer = 10  # Wait 10 minutes (configurable)
+            self.waiting_at_carcass = carcass
+        elif self.cooperates and self.waiting_at_carcass == carcass:
+            # Continue waiting
+            can_eat = self.wait_at_carcass(carcass)
+            if can_eat:
+                self._consume_meat(carcass)
+        else:
+            # Non-cooperator can't handle large carcass
+            self.ignore_carcass(carcass)
+
+    def notify_others_of_carcass(self, carcass):
+        """
+        Cooperators call others to carcasses within earshot.
+
+        From Agent.java:1847-1849
+        """
+        if not self.cooperates:
+            return
+
+        # Add to shared found carcasses list
+        if carcass not in self.model.found_carcasses:
+            self.model.found_carcasses.append(carcass)
+
+        # Could add logging here for debugging
+        # print(f"Agent {self.unique_id} called others to carcass at {carcass.location}")
+
+    def check_for_carcass_calls(self):
+        """
+        Check if other agents have called about carcasses within earshot.
+
+        From Agent.java:1266-1394
+
+        Returns:
+            Carcass object if one is found within earshot, None otherwise
+        """
+        if not self.can_eat_meat:
+            return None
+
+        if not self.model.found_carcasses:
+            return None
+
+        # Get earshot distance from parameters (default 10 cells)
+        earshot = int(self.model.params.earshot_distance)
+
+        # Find closest carcass within earshot
+        closest_carcass = None
+        closest_distance = earshot + 1  # Start beyond earshot
+
+        for carcass in self.model.found_carcasses:
+            # Skip if already ignored
+            if hasattr(self, 'ignored_carcasses') and carcass in self.ignored_carcasses:
+                continue
+
+            # Calculate Manhattan distance (faster than Euclidean)
+            dx = abs(carcass.location[0] - self.pos[0])
+            dy = abs(carcass.location[1] - self.pos[1])
+
+            # Account for toroidal wrapping
+            if dx > self.model.grid.width / 2:
+                dx = self.model.grid.width - dx
+            if dy > self.model.grid.height / 2:
+                dy = self.model.grid.height - dy
+
+            distance = dx + dy  # Manhattan distance
+
+            if distance <= earshot and distance < closest_distance:
+                closest_distance = distance
+                closest_carcass = carcass
+
+        return closest_carcass
+
+    def ignore_carcass(self, carcass):
+        """Add carcass to ignore list for this day."""
+        if carcass not in self.ignored_carcasses:
+            self.ignored_carcasses.append(carcass)
+
+    def is_carcass_ignored(self, carcass):
+        """Check if carcass is being ignored."""
+        return carcass in self.ignored_carcasses
+
+    def wait_at_carcass(self, carcass):
+        """
+        Wait for other agents to arrive at medium/large carcass.
+
+        From Agent.java:685-719
+        """
+        # Count how many agents of same species are at carcass
+        n_agents_present = len([
+            a for a in self.model.hominid_agents
+            if a.pos == carcass.location and a.species == self.species
+        ])
+
+        # Get required number from parameters
+        required = int(self.model.params.number_of_agents_for_carcass)
+
+        if n_agents_present >= required:
+            # Enough agents arrived, start eating
+            self.wait_timer = 0
+            self.waiting_at_carcass = None
+            return True  # Ready to eat
+
+        # Check if wait timer expired
+        if self.wait_timer <= 0:
+            # Give up on this carcass
+            self.ignore_carcass(carcass)
+            self.waiting_at_carcass = None
+            return False  # Gave up
+
+        # Continue waiting
+        self.wait_timer -= 1
+        return False  # Still waiting
+
+    def _consume_meat(self, carcass):
+        """
+        Actually consume meat from carcass.
+        Extracted from scavenge_carcass for cleaner logic.
+        """
+        from carcass_system import calculate_meat_consumption
+
         # Calculate how much meat to consume
         meat_grams = calculate_meat_consumption(carcass, self, self.model.params)
-        
-        if meat_grams <= 0:
+        actual_consumed = min(
+            meat_grams,
+            self.belly_capacity_grams - self.gut_contents_grams
+        )
+
+        if actual_consumed <= 0:
             return
-        
-        # Check gut capacity
-        if self.gut_contents_grams + meat_grams > self.belly_capacity_grams:
-            meat_grams = self.belly_capacity_grams - self.gut_contents_grams
-        
-        if meat_grams <= 0:
-            return
-        
-        # Consume meat from carcass
-        actual_consumed = carcass.consume_meat(meat_grams)
-        
-        # Calculate calories gained
+
+        # Remove from carcass
+        carcass.consume_meat(actual_consumed)
+
+        # Calculate calories
         calories_gained = actual_consumed * self.model.params.carcass_calories_per_gram
-        
+
         # Update agent state
         self.calories_today += calories_gained
         self.gut_contents_grams += actual_consumed
-        
-        # Log activity (for output generation)
+
+        # Track by season and day
+        season_idx = self.model.current_season - 1
+        day_idx = self.model.current_day - 1
+
+        self.carcass_calories_by_season[season_idx] += calories_gained
+        self.daily_carcass_calories[day_idx] += calories_gained
+
+        # Log activity
         if self.pos not in self.activity_log:
             self.activity_log[self.pos] = {'eating': 0, 'traveling': 0}
         self.activity_log[self.pos]['eating'] += 1
-    
+
     def choose_best_food(self, food_options):
         """
-        Apply optimal foraging: choose food with highest return rate
-        that agent can eat and has capacity for.
-        
+        Apply optimal foraging: choose food with highest return rate.
+        If ties, choose closest. If still tied, random.
+
+        From Agent.java:973-1102 (plantScan prioritization)
+
         Args:
-            food_options: List of (PlantSpecies, amount) tuples
-            
+            food_options: List of (PlantSpecies, amount, cell_pos, distance) tuples
+
         Returns:
-            PlantSpecies with highest return rate, or None
+            Tuple of (PlantSpecies, cell_pos) or (None, None)
         """
         if not food_options:
-            return None
-        
+            return None, None
+
         # Filter out foods we can't eat due to gut capacity
         viable_options = []
-        for species, amount in food_options:
+        for species, amount, cell_pos, distance in food_options:
             if amount > 0 and self.gut_contents_grams < self.belly_capacity_grams:
-                viable_options.append(species)
-        
+                viable_options.append((species, cell_pos, distance))
+
         if not viable_options:
-            return None
-        
-        # Choose highest return rate (optimal foraging)
-        best_food = max(viable_options, key=lambda s: s.return_rate)
-        return best_food
+            return None, None
+
+        # Sort by: 1) return rate (descending), 2) distance (ascending)
+        # This gives us highest caloric value first, then closest
+        viable_options.sort(key=lambda x: (-x[0].return_rate, x[2]))
+
+        # Get all options with best return rate and distance
+        best_rate = viable_options[0][0].return_rate
+        best_distance = viable_options[0][2]
+
+        best_foods = [(sp, pos) for sp, pos, dist in viable_options
+                      if sp.return_rate == best_rate and dist == best_distance]
+
+        # Random tiebreaker
+        if best_foods:
+            return self.random.choice(best_foods)
+
+        return None, None
     
     def eat_food(self, plant_species: 'PlantSpecies'):
         """
@@ -446,11 +657,26 @@ class HominidAgent(Agent):
         
         # Calculate calories gained
         calories_gained = grams_to_eat * plant_species.calories_per_gram
-        
+
         # Update agent state
         self.calories_today += calories_gained
         self.gut_contents_grams += grams_to_eat
-        
+
+        # Track by season and day
+        season_idx = self.model.current_season - 1  # Seasons are 1-indexed
+        day_idx = self.model.current_day - 1  # Days are 1-indexed
+
+        # Track plant calories
+        self.plant_calories_by_season[season_idx] += calories_gained
+        self.daily_plant_calories[day_idx] += calories_gained
+
+        # Track root vs non-root
+        # Roots are plants with tools_required or has_digging_phase
+        if plant_species.tools_required or plant_species.has_digging_phase:
+            self.root_calories_by_season[season_idx] += calories_gained
+        else:
+            self.nonroot_calories_by_season[season_idx] += calories_gained
+
         # Remove food from cell
         if hasattr(self, 'pos') and self.pos:
             cell_contents = self.model.grid.get_cell_list_contents([self.pos])
@@ -464,34 +690,201 @@ class HominidAgent(Agent):
         if self.pos not in self.activity_log:
             self.activity_log[self.pos] = {'eating': 0, 'traveling': 0}
         self.activity_log[self.pos]['eating'] += 1
-    
+
+    def calculate_distance(self, pos1, pos2):
+        """
+        Calculate Euclidean distance between two positions.
+        Accounts for toroidal wrapping.
+
+        Args:
+            pos1: First position (x, y)
+            pos2: Second position (x, y)
+
+        Returns:
+            float: Euclidean distance
+        """
+        x1, y1 = pos1
+        x2, y2 = pos2
+
+        # Account for toroidal wrapping
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+
+        # Check if wrapping is shorter
+        if dx > self.model.grid.width / 2:
+            dx = self.model.grid.width - dx
+        if dy > self.model.grid.height / 2:
+            dy = self.model.grid.height - dy
+
+        return (dx**2 + dy**2)**0.5
+
+    def evaluate_cell_prospects(self, cell_pos):
+        """
+        Evaluate food prospects in a given cell.
+
+        From Agent.java:973-1102 (plantScan and bestVisibleCrop)
+
+        Args:
+            cell_pos: Grid position (x, y) to evaluate
+
+        Returns:
+            float: Estimated caloric value available in cell
+        """
+        cell_contents = self.model.grid.get_cell_list_contents([cell_pos])
+
+        # Find CellFood object
+        cell_food = None
+        for obj in cell_contents:
+            if isinstance(obj, CellFood):
+                cell_food = obj
+                break
+
+        if not cell_food:
+            return 0.0
+
+        # Get available foods
+        available_foods = cell_food.get_available_food(
+            self.model.plant_species,
+            self.model.current_season
+        )
+
+        # Calculate total caloric value considering visibility
+        total_value = 0.0
+        for species, amount in available_foods:
+            if species.can_be_eaten_by(self.species.value, self.can_dig):
+                # Expected value = return rate (calories per minute)
+                # Higher return rate = more valuable food
+                total_value += species.return_rate * species.visibility_probability
+
+        return total_value
+
     def move_toward_food(self):
         """
-        Move to an adjacent cell with better foraging prospects.
-        Uses simple random movement for now.
-        TODO: Implement diagonal-first movement algorithm from original model.
+        Intelligent movement: scan neighbors, evaluate prospects, move to best.
+
+        Algorithm from Agent.java:973-1102:
+        1. Scan all 8 neighbors + current cell (9 cells total)
+        2. Evaluate food prospects in each
+        3. For cells with food, prioritize by:
+           a) Highest caloric value (return rate)
+           b) Closest distance (tiebreaker)
+        4. If no food in neighborhood, wander to distant cell
         """
         if not hasattr(self, 'pos') or self.pos is None:
             return
-        
-        # Get neighboring cells (including diagonals)
+
+        # Get Moore neighborhood (8 neighbors + current cell)
         neighbors = self.model.grid.get_neighborhood(
             self.pos,
-            moore=True,  # Include diagonals
-            include_center=False
+            moore=True,
+            include_center=True
         )
-        
-        if neighbors:
-            # For now, move randomly
-            # TODO: Evaluate food availability in each neighbor and move to best
-            new_pos = self.random.choice(neighbors)
+
+        # Evaluate each cell
+        cell_evaluations = []
+        for cell_pos in neighbors:
+            caloric_value = self.evaluate_cell_prospects(cell_pos)
+            distance = self.calculate_distance(self.pos, cell_pos)
+
+            # Classify by distance for original's orientation categories
+            if distance < 0.01:
+                orientation = 'same'
+            elif distance < 1.01:
+                orientation = 'adjacent'
+            else:
+                orientation = 'corner'
+
+            cell_evaluations.append({
+                'pos': cell_pos,
+                'value': caloric_value,
+                'distance': distance,
+                'orientation': orientation
+            })
+
+        # Find best cells (highest value, then closest)
+        best_cells = []
+        best_value = 0.0
+        best_distance = float('inf')
+
+        for cell in cell_evaluations:
+            if cell['value'] > best_value:
+                # Found better food
+                best_cells = [cell]
+                best_value = cell['value']
+                best_distance = cell['distance']
+            elif cell['value'] == best_value and cell['value'] > 0:
+                # Same value, check distance
+                if cell['distance'] < best_distance:
+                    best_cells = [cell]
+                    best_distance = cell['distance']
+                elif cell['distance'] == best_distance:
+                    best_cells.append(cell)
+
+        if best_cells and best_value > 0:
+            # Move to one of the best cells (random tiebreaker)
+            chosen = self.random.choice(best_cells)
+            if chosen['pos'] != self.pos:
+                self.model.grid.move_agent(self, chosen['pos'])
+
+                # Log travel
+                if chosen['pos'] not in self.activity_log:
+                    self.activity_log[chosen['pos']] = {'eating': 0, 'traveling': 0}
+                self.activity_log[chosen['pos']]['traveling'] += 1
+        else:
+            # No food in neighborhood - wander toward distant cell
+            self._wander_to_distant_cell()
+
+    def _wander_to_distant_cell(self):
+        """
+        When no food in neighborhood, wander toward distant cell.
+        Uses wandering_distance parameter from original model.
+
+        From Agent.java:1040-1050
+        """
+        # Get cells at wandering distance (default 2 cells away)
+        wander_dist = int(self.model.params.wandering_distance)
+
+        # Get cells at approximately wandering_distance away
+        distant_cells = []
+        for dx in range(-wander_dist, wander_dist + 1):
+            for dy in range(-wander_dist, wander_dist + 1):
+                # Skip cells too close
+                if abs(dx) < wander_dist and abs(dy) < wander_dist:
+                    continue
+
+                new_x = (self.pos[0] + dx) % self.model.grid.width
+                new_y = (self.pos[1] + dy) % self.model.grid.height
+                distant_cells.append((new_x, new_y))
+
+        if distant_cells:
+            target = self.random.choice(distant_cells)
+
+            # Move one step toward target (diagonal-first)
+            dx = target[0] - self.pos[0]
+            dy = target[1] - self.pos[1]
+
+            # Account for toroidal wrapping - go the shorter way
+            if abs(dx) > self.model.grid.width / 2:
+                dx = -int(dx / abs(dx)) * (self.model.grid.width - abs(dx))
+            if abs(dy) > self.model.grid.height / 2:
+                dy = -int(dy / abs(dy)) * (self.model.grid.height - abs(dy))
+
+            # Determine move direction (diagonal first, then cardinal)
+            step_x = 0 if dx == 0 else (1 if dx > 0 else -1)
+            step_y = 0 if dy == 0 else (1 if dy > 0 else -1)
+
+            new_pos = (
+                (self.pos[0] + step_x) % self.model.grid.width,
+                (self.pos[1] + step_y) % self.model.grid.height
+            )
+
             self.model.grid.move_agent(self, new_pos)
-            
-            # Log travel
+
+            # Log wandering
             if new_pos not in self.activity_log:
                 self.activity_log[new_pos] = {'eating': 0, 'traveling': 0}
             self.activity_log[new_pos]['traveling'] += 1
-    
+
     def find_nest_site(self):
         """
         Find appropriate nesting location based on nesting strategy
@@ -653,7 +1046,10 @@ class HOMINIDSModel(Model):
         
         # Initialize carcass manager
         self.carcass_manager = CarcassManager(self, self.params)
-        
+
+        # Shared found carcasses list for agent communication
+        self.found_carcasses = []  # Carcasses discovered this timestep
+
         # Set up data collection
         self._setup_data_collection()
         
@@ -743,6 +1139,9 @@ class HOMINIDSModel(Model):
         """
         Execute one time step (1 minute) of the simulation.
         """
+        # Clear found carcasses list each timestep
+        self.found_carcasses = []
+
         # Advance all agents in random order
         agents_shuffled = self.hominid_agents.copy()
         self.random.shuffle(agents_shuffled)
@@ -798,6 +1197,10 @@ class HOMINIDSModel(Model):
             # Reset nesting state for new day
             agent.is_nesting = False
             agent.nest_location = None
+            # Reset ignored carcasses each day
+            agent.ignored_carcasses = []
+            agent.wait_timer = 0
+            agent.waiting_at_carcass = None
         
         # Check for new season
         if self.current_day > 365:

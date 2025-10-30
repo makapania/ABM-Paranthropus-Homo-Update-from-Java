@@ -122,11 +122,12 @@ class CellFood(Agent):
         super().__init__(model)
         self.topography = topography
         self.params = params
-        
+        self.plant_species_list = plant_species_list  # Store reference for seasonal fruiting checks
+
         # Initialize food amounts for each species
         self.food_amounts = {}  # species_id -> current food units
         self.max_food_amounts = {}  # species_id -> carrying capacity
-        
+
         for species in plant_species_list:
             # Determine carrying capacity based on topography
             if topography.name == 'CHANNEL':
@@ -158,12 +159,17 @@ class CellFood(Agent):
         
         for species_id, max_amount in self.max_food_amounts.items():
             current = self.food_amounts[species_id]
-            
+
             # Check if this species fruits in current season
-            # For now, assume all species fruit in all seasons
-            # TODO: Use actual seasonal fruiting patterns from plant species
-            is_fruiting_season = True  # Placeholder
-            
+            # Look up species object to get seasonal fruiting pattern
+            species = next((s for s in self.plant_species_list if s.species_id == species_id), None)
+            if species:
+                # Season is 1-4, but seasons_fruiting list is 0-indexed
+                is_fruiting_season = species.seasons_fruiting[season - 1]
+            else:
+                # Fallback if species not found
+                is_fruiting_season = True
+
             if is_fruiting_season and max_amount > 0:
                 # During fruiting: grow toward maximum
                 target = max_amount * self.params.final_food_percentage
@@ -251,16 +257,58 @@ def load_plant_species(excel_file: str, landscape: str) -> List[PlantSpecies]:
         
         # Get species ID
         species_id = int(params.get('id number', row - 1))
-        
-        # Simplified seasonal fruiting for now
-        # TODO: Load actual fruiting patterns from Excel
-        params['seasons_fruiting'] = [True, True, True, True]  # Fruits all seasons
-        
-        # Default values if not in Excel
-        params.setdefault('grams_per_feeding_unit', 100.0)
-        params.setdefault('calories_per_gram', 2.0)
-        params.setdefault('visibility_probability', 0.7)
-        params.setdefault('handling_time_minutes', 5.0)
+
+        # Helper function to safely convert to float
+        def safe_float(value, default):
+            """Convert value to float, using default if empty or invalid."""
+            if value == '' or value is None:
+                return default
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+
+        # Map Excel column names to parameter names expected by PlantSpecies
+        # Excel uses "plants per channel cell" but code expects "plants_per_channel"
+        params['plants_per_channel'] = safe_float(params.get('plants per channel cell'), 0.0)
+        params['plants_per_flooded'] = safe_float(params.get('plants per flooded cell'), 0.0)
+        params['plants_per_unflooded'] = safe_float(params.get('plants per unflooded cell'), 0.0)
+
+        # Load seasonal fruiting from Excel (column 13: "season availability")
+        # Format is 4 characters representing 4 seasons (y = fruits, _ or n = doesn't)
+        season_avail_str = str(params.get('season availability', 'yyyy')).lower()
+        params['seasons_fruiting'] = [
+            season_avail_str[0] == 'y' if len(season_avail_str) > 0 else True,
+            season_avail_str[1] == 'y' if len(season_avail_str) > 1 else True,
+            season_avail_str[2] == 'y' if len(season_avail_str) > 2 else True,
+            season_avail_str[3] == 'y' if len(season_avail_str) > 3 else True,
+        ]
+
+        # Load real parameter values from Excel
+        # Grams per feeding unit (column 19: "food weight in grams")
+        params['grams_per_feeding_unit'] = safe_float(
+            params.get('food weight in grams'), 100.0
+        )
+
+        # Calories per gram (column 26: "digestible calories per gram")
+        params['calories_per_gram'] = safe_float(
+            params.get('digestible calories per gram'), 2.0
+        )
+
+        # Visibility probability (column 16: "same cell detection probability")
+        params['visibility_probability'] = safe_float(
+            params.get('same cell detection probability'), 0.7
+        )
+
+        # Handling time in minutes (from column 24: "boisei food harvested per hour")
+        # Time per item = 60 minutes / items_per_hour
+        boisei_harvest_rate = safe_float(
+            params.get('boisei food harvested per hour'), 12.0
+        )
+        if boisei_harvest_rate > 0:
+            params['handling_time_minutes'] = 60.0 / boisei_harvest_rate
+        else:
+            params['handling_time_minutes'] = 5.0  # Default if no harvest rate
         
         species = PlantSpecies(species_id, str(name), params)
         plant_species.append(species)
